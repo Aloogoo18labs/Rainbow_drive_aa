@@ -1132,3 +1132,84 @@ def rda_smoke_run(
     reads_ok = 0
     repaired = 0
     for k in keys:
+        data, rr = cl.get(k)
+        if len(data) > 0:
+            reads_ok += 1
+        if rr.repaired:
+            repaired += 1
+
+    audit_rows = []
+    for _ in range(max(0, int(audits))):
+        audit_rows.append(cl.audit(sample_objects=6, per_node_sample=11))
+
+    return {
+        "schema": RDA_SCHEMA,
+        "cluster_id": cl.cluster_id,
+        "objects": len(keys),
+        "reads_ok": reads_ok,
+        "repaired_on_read": repaired,
+        "replicas_deleted": removed,
+        "manifests": receipts[: min(6, len(receipts))],
+        "audit": audit_rows[-1] if audit_rows else None,
+        "events_tail": json.loads(cl.log.as_json(42))["events"],
+    }
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    out = rda_smoke_run(
+        objects=args.objects,
+        object_bytes=args.object_bytes,
+        chaos_intensity=args.chaos,
+        audits=args.audits,
+        seed=args.seed,
+    )
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_put_get(args: argparse.Namespace) -> int:
+    cl = _mk_demo_cluster(nodes=args.nodes, seed=args.seed, fault_rate=args.fault_rate)
+    payload = args.data.encode() if args.data is not None else _rand_payload_bytes(args.bytes, flavor="cli")
+    key = args.key or f"rainbow://drive-aa/{uuid.uuid4().hex}"
+    wr = cl.put(key, payload)
+    if args.chaos > 0:
+        cl.forget_some_replicas(intensity=args.chaos)
+    got, rr = cl.get(key)
+    ok = got == payload
+    report = {
+        "schema": RDA_SCHEMA,
+        "cluster_id": cl.cluster_id,
+        "key": key,
+        "manifest": wr.manifest_digest,
+        "bytes_in": len(payload),
+        "bytes_out": len(got),
+        "ok": ok,
+        "repaired_on_read": rr.repaired,
+        "served_from": rr.served_from,
+        "state": cl.export_state() if args.state else None,
+        "events": json.loads(cl.log.as_json(60))["events"] if args.events else None,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if ok else 2
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    cl = _mk_demo_cluster(nodes=args.nodes, seed=args.seed, fault_rate=args.fault_rate)
+    # Seed a few objects to make audit meaningful.
+    for i in range(max(1, args.objects)):
+        key = f"rainbow://drive-aa/audit/{uuid.uuid4().hex}/{i}"
+        cl.put(key, _rand_payload_bytes(args.object_bytes + i * 111, flavor="audit"))
+    if args.chaos > 0:
+        cl.forget_some_replicas(intensity=args.chaos)
+    rep = cl.audit(sample_objects=args.sample_objects, per_node_sample=args.per_node_sample)
+    out = {
+        "schema": RDA_SCHEMA,
+        "audit": rep,
+        "events": json.loads(cl.log.as_json(72))["events"],
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
