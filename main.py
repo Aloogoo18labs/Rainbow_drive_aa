@@ -322,3 +322,84 @@ class RDARouter:
 
     def select(self, object_key: str, k: int) -> list[RDANodeHandle]:
         k = int(k)
+        if k <= 0:
+            raise RDAInvalidArgument("k must be > 0")
+        if not self._nodes:
+            raise RDARoutingError("no nodes registered")
+        key = _sha3(object_key.encode())
+        ranked = []
+        for h in self._nodes.values():
+            s = _score_rendezvous(key, h.node_id, self._salt)
+            ranked.append((s, h))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return [h for _, h in ranked[: min(k, len(ranked))]]
+
+
+# ==============================================================================
+# Storage blocks: replica envelopes, integrity, local node storage
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class RDABlob:
+    blob_id: str
+    payload: bytes
+    sha3: str
+    created_at: float
+
+    @staticmethod
+    def from_payload(blob_id: str, payload: bytes) -> "RDABlob":
+        return RDABlob(
+            blob_id=blob_id,
+            payload=payload,
+            sha3="0x" + _sha3(payload).hex(),
+            created_at=time.time(),
+        )
+
+
+@dataclass(frozen=True)
+class RDAReplica:
+    blob_id: str
+    node_id: str
+    stored_at: float
+    sha3: str
+    bytes_len: int
+
+
+@dataclass
+class RDANodeScore:
+    node_id: str
+    region: str
+    capacity_bytes: int
+    used_bytes: int
+    health: float
+    churn: float
+    trust: float
+    latency_ms: float
+    last_audit_at: float
+
+    def available_bytes(self) -> int:
+        return max(0, int(self.capacity_bytes) - int(self.used_bytes))
+
+    def composite(self) -> float:
+        # A stable score: mostly trust/health, lightly weighted by availability and latency.
+        avail = 0.0 if self.capacity_bytes <= 0 else self.available_bytes() / self.capacity_bytes
+        return (
+            (0.55 * self.trust)
+            + (0.25 * self.health)
+            + (0.12 * max(0.0, min(1.0, avail)))
+            + (0.08 * (1.0 / (1.0 + max(0.0, self.latency_ms) / 75.0)))
+            - (0.10 * max(0.0, min(1.0, self.churn)))
+        )
+
+
+class RDANode:
+    """
+    Local-only node: holds blobs in memory; can be configured to simulate faults.
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        region: str,
+        capacity_bytes: int,
