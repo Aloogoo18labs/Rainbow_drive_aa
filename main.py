@@ -403,3 +403,84 @@ class RDANode:
         node_id: str,
         region: str,
         capacity_bytes: int,
+        fault_rate: float = 0.0,
+        jitter_ms: tuple[int, int] = (2, 12),
+    ) -> None:
+        self.node_id = node_id
+        self.region = region
+        self.capacity_bytes = int(capacity_bytes)
+        self._fault_rate = float(fault_rate)
+        self._jitter_ms = (int(jitter_ms[0]), int(jitter_ms[1]))
+        self._store: dict[str, RDABlob] = {}
+        self._replicas: dict[str, RDAReplica] = {}
+        self._used = 0
+        self._join_at = time.time()
+        self._last_seen = time.time()
+        self._audit_at = 0.0
+        self._churn = 0.0
+        self._trust = 0.84 + random.random() * 0.12
+        self._health = 0.88 + random.random() * 0.10
+
+    def _maybe_fault(self) -> None:
+        if self._fault_rate <= 0:
+            return
+        if random.random() < self._fault_rate:
+            raise RDAFault(f"RDA: simulated node fault ({self.node_id})")
+
+    def _jitter(self) -> float:
+        lo, hi = self._jitter_ms
+        if hi <= lo:
+            return float(lo)
+        return float(random.randint(lo, hi))
+
+    def score(self) -> RDANodeScore:
+        now = time.time()
+        alive = max(0.0, min(1.0, 1.0 - (now - self._last_seen) / 180.0))
+        health = max(0.0, min(1.0, (0.7 * self._health) + (0.3 * alive)))
+        churn = max(0.0, min(1.0, self._churn))
+        trust = max(0.0, min(1.0, self._trust))
+        latency = self._jitter()
+        return RDANodeScore(
+            node_id=self.node_id,
+            region=self.region,
+            capacity_bytes=self.capacity_bytes,
+            used_bytes=self._used,
+            health=health,
+            churn=churn,
+            trust=trust,
+            latency_ms=latency,
+            last_audit_at=self._audit_at,
+        )
+
+    def touch(self) -> None:
+        self._last_seen = time.time()
+        self._churn = max(0.0, min(1.0, self._churn * 0.92))
+
+    def leave(self) -> None:
+        # Mark as "churny" to bias placement away.
+        self._churn = min(1.0, self._churn + 0.33)
+        self._last_seen = time.time() - 10_000
+
+    def has(self, blob_id: str) -> bool:
+        return blob_id in self._store
+
+    def put(self, blob: RDABlob) -> RDAReplica:
+        self._maybe_fault()
+        self.touch()
+        if blob.blob_id in self._store:
+            r = self._replicas[blob.blob_id]
+            return r
+        need = len(blob.payload)
+        if need > self.capacity_bytes:
+            raise RDAAdmissionDenied("RDA: object too large for node")
+        if self._used + need > self.capacity_bytes:
+            raise RDAAdmissionDenied("RDA: node out of capacity")
+        self._store[blob.blob_id] = blob
+        self._used += need
+        rep = RDAReplica(
+            blob_id=blob.blob_id,
+            node_id=self.node_id,
+            stored_at=time.time(),
+            sha3=blob.sha3,
+            bytes_len=need,
+        )
