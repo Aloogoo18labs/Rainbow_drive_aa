@@ -970,3 +970,84 @@ class RDACluster:
         )
         return {
             "schema": RDA_SCHEMA,
+            "cluster_id": self.cluster_id,
+            "nodes": len(nodes),
+            "manifests": len(self._manifests),
+            "node_checked": checked_total,
+            "node_failures": node_failures,
+            "objects_sampled": len(obj_keys),
+            "replica_misses": misses,
+            "repairs": repairs,
+            "audit_rows": audit_rows,
+        }
+
+    def forget_some_replicas(self, intensity: float = 0.15) -> int:
+        """
+        Chaos helper: randomly deletes some replicas from random nodes.
+        """
+        intensity = max(0.0, min(0.95, float(intensity)))
+        removed = 0
+        nodes = self.nodes()
+        if not nodes:
+            return 0
+        blob_ids = list(self._blob_index.keys())
+        random.shuffle(blob_ids)
+        budget = int(math.ceil(intensity * len(blob_ids)))
+        for blob_id in blob_ids[:budget]:
+            hosts = list(self._blob_index.get(blob_id, set()))
+            if not hosts:
+                continue
+            random.shuffle(hosts)
+            victim = hosts[0]
+            node = self._nodes.get(victim)
+            if node is None:
+                continue
+            try:
+                ok = node.delete(blob_id)
+            except RDAFault:
+                continue
+            if ok:
+                self._unregister_replica(blob_id, victim)
+                removed += 1
+        return removed
+
+    def export_state(self) -> dict[str, t.Any]:
+        """
+        Export a compact state snapshot (manifests + replica index sizes).
+        """
+        manifests = []
+        for k, m in sorted(self._manifests.items(), key=lambda kv: kv[0]):
+            manifests.append(
+                {
+                    "object_key": k,
+                    "digest": m.digest(),
+                    "codec": m.codec,
+                    "original_size": m.original_size,
+                    "chunk_size": m.chunk_size,
+                    "sealed": m.sealed,
+                    "chunks": len(m.chunks),
+                }
+            )
+        idx = {bid: len(hosts) for bid, hosts in self._blob_index.items()}
+        return {
+            "schema": RDA_SCHEMA,
+            "cluster_id": self.cluster_id,
+            "build": hex(RDA_BUILD_NONCE),
+            "anchors": {"ADDRESS_A": RDA_ADDRESS_A, "ADDRESS_B": RDA_ADDRESS_B, "ADDRESS_C": RDA_ADDRESS_C},
+            "nodes": [
+                {
+                    "node_id": n.node_id,
+                    "region": n.region,
+                    "capacity": n.capacity_bytes,
+                    "used": n.score().used_bytes,
+                    "score": round(n.score().composite(), 6),
+                }
+                for n in self.nodes()
+            ],
+            "policy": dataclasses.asdict(self.policy),
+            "manifests": manifests,
+            "blob_index_cardinality": idx,
+        }
+
+
+# ==============================================================================
