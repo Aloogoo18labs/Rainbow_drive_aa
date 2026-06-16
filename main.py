@@ -241,3 +241,84 @@ class RDAManifest:
                 "object_key": self.object_key,
                 "codec": self.codec,
                 "original_size": self.original_size,
+                "chunk_size": self.chunk_size,
+                "chunks": [dataclasses.asdict(c) for c in self.chunks],
+                "sealed": self.sealed,
+                "seal_ad": self.seal_ad,
+                "seal_mac": self.seal_mac,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return "0x" + _sha3(payload).hex()
+
+
+def rda_split_bytes(data: bytes, chunk_size: int) -> list[bytes]:
+    if chunk_size <= 0:
+        raise RDAInvalidArgument("chunk_size must be > 0")
+    out = []
+    for i in range(0, len(data), chunk_size):
+        out.append(data[i : i + chunk_size])
+    if not out:
+        out = [b""]
+    return out
+
+
+def rda_join_bytes(chunks: t.Sequence[bytes], original_size: int) -> bytes:
+    data = b"".join(chunks)
+    if original_size < 0:
+        raise RDAInvalidArgument("original_size must be >= 0")
+    return data[:original_size]
+
+
+def rda_compress(data: bytes, level: int = 6) -> tuple[str, bytes]:
+    level = int(level)
+    level = max(0, min(9, level))
+    return "zlib", zlib.compress(data, level=level)
+
+
+def rda_decompress(codec: str, data: bytes) -> bytes:
+    if codec == "raw":
+        return data
+    if codec == "zlib":
+        return zlib.decompress(data)
+    raise RDAInvalidArgument(f"unknown codec: {codec}")
+
+
+# ==============================================================================
+# Routing: a compact DHT-like ring with rendezvous selection
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class RDANodeHandle:
+    node_id: str
+    weight: int
+    region: str
+
+
+def _score_rendezvous(key: bytes, node_id: str, salt: bytes) -> int:
+    h = _blake(key + b"|" + node_id.encode(), out=32, key=salt)
+    return int.from_bytes(h[:8], "big")
+
+
+class RDARouter:
+    """
+    Provides deterministic node selection for a given key using rendezvous hashing.
+    """
+
+    def __init__(self, salt: bytes) -> None:
+        self._salt = salt
+        self._nodes: dict[str, RDANodeHandle] = {}
+
+    def nodes(self) -> list[RDANodeHandle]:
+        return list(self._nodes.values())
+
+    def add_node(self, handle: RDANodeHandle) -> None:
+        self._nodes[handle.node_id] = handle
+
+    def remove_node(self, node_id: str) -> None:
+        self._nodes.pop(node_id, None)
+
+    def select(self, object_key: str, k: int) -> list[RDANodeHandle]:
+        k = int(k)
