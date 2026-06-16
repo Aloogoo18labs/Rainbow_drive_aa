@@ -889,3 +889,84 @@ class RDACluster:
             self._register_replica(rep)
             placed += 1
             self._log.emit(
+                RDAEventKind.AUDIT_REPAIR,
+                n.node_id,
+                {"object_key": object_key, "blob_id": cref.blob_id, "chunk": cref.idx},
+            )
+            if len(self._blob_index.get(cref.blob_id, set())) >= self.policy.replicas:
+                break
+        return placed
+
+    def audit(self, sample_objects: int = 8, per_node_sample: int = 10) -> dict[str, t.Any]:
+        """
+        Runs:
+        - per-node audits (local integrity)
+        - global missing-replica checks for a sample of objects
+        - repair attempts where possible
+        """
+        sample_objects = max(0, int(sample_objects))
+        per_node_sample = max(0, int(per_node_sample))
+        nodes = self.nodes()
+        audit_rows: list[dict[str, t.Any]] = []
+        node_failures = 0
+        checked_total = 0
+
+        for n in nodes:
+            checked, failures = n.audit(sample=max(1, per_node_sample))
+            checked_total += checked
+            node_failures += failures
+            s = n.score()
+            self._log.emit(
+                RDAEventKind.NODE_SCORE,
+                n.node_id,
+                {"health": round(s.health, 4), "trust": round(s.trust, 4), "churn": round(s.churn, 4)},
+            )
+            audit_rows.append(
+                {
+                    "node_id": n.node_id,
+                    "region": n.region,
+                    "checked": checked,
+                    "failures": failures,
+                    "used": s.used_bytes,
+                    "cap": s.capacity_bytes,
+                    "score": round(s.composite(), 6),
+                }
+            )
+
+        # Sample objects for replica deficits
+        obj_keys = list(self._manifests.keys())
+        random.shuffle(obj_keys)
+        obj_keys = obj_keys[: min(sample_objects, len(obj_keys))]
+
+        repairs = 0
+        misses = 0
+        for k in obj_keys:
+            m = self._manifests[k]
+            for cref in m.chunks:
+                present = self._blob_index.get(cref.blob_id, set())
+                if len(present) >= self.policy.write_quorum:
+                    continue
+                misses += 1
+                self._log.emit(
+                    RDAEventKind.AUDIT_MISS,
+                    None,
+                    {"object_key": k, "blob_id": cref.blob_id, "have": len(present), "need": self.policy.write_quorum},
+                )
+                try:
+                    repairs += self._repair_blob(k, cref)
+                except (RDAFault, RDAQuorumError, RDANotFound):
+                    continue
+
+        self._log.emit(
+            RDAEventKind.AUDIT_RUN,
+            None,
+            {
+                "checked_total": checked_total,
+                "node_failures": node_failures,
+                "objects_sampled": len(obj_keys),
+                "misses": misses,
+                "repairs": repairs,
+            },
+        )
+        return {
+            "schema": RDA_SCHEMA,
