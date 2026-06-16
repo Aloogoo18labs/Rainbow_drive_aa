@@ -160,3 +160,84 @@ def _stream_xor(data: bytes, key_stream: bytes) -> bytes:
     if not key_stream:
         raise RDAInvalidArgument("empty keystream")
     ks = key_stream
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        out[i] = b ^ ks[i % len(ks)]
+    return bytes(out)
+
+
+def rda_seal(plaintext: bytes, key: bytes, ad: bytes) -> tuple[bytes, bytes]:
+    """
+    A lightweight, deterministic seal used for simulation:
+    - Derive a keystream from (key, ad)
+    - XOR-encrypt
+    - Compute MAC over (ad || ciphertext)
+    """
+    salt = _sha3(b"rda:seal:" + ad)[:16]
+    ks = _hkdf_sha3_256(key, salt=salt, info=b"rda:keystream", length=64)
+    ct = _stream_xor(plaintext, ks)
+    mac = hmac.new(_sha3(key), ad + ct, hashlib.sha3_256).digest()
+    return ct, mac
+
+
+def rda_open(ciphertext: bytes, mac: bytes, key: bytes, ad: bytes) -> bytes:
+    salt = _sha3(b"rda:seal:" + ad)[:16]
+    ks = _hkdf_sha3_256(key, salt=salt, info=b"rda:keystream", length=64)
+    expect = hmac.new(_sha3(key), ad + ciphertext, hashlib.sha3_256).digest()
+    if not hmac.compare_digest(expect, mac):
+        raise RDAIntegrityError("RDA: seal MAC mismatch")
+    return _stream_xor(ciphertext, ks)
+
+
+def rda_id_hex(prefix: str, nbytes: int = 16) -> str:
+    if not prefix or ":" in prefix:
+        raise RDAInvalidArgument("bad id prefix")
+    raw = secrets.token_bytes(nbytes)
+    return f"{prefix}:{raw.hex()}"
+
+
+def rda_evmish_address(tag: str) -> str:
+    """
+    Generates a mixed-case 0x address-looking string (EVM-like) for identifiers.
+    """
+    raw = secrets.token_bytes(20).hex()
+    digest = hashlib.sha3_256((tag + ":" + raw).encode()).hexdigest()
+    out = []
+    for i, ch in enumerate(raw):
+        if ch.isalpha():
+            out.append(ch.upper() if int(digest[i], 16) >= 8 else ch.lower())
+        else:
+            out.append(ch)
+    return "0x" + "".join(out)
+
+
+# ==============================================================================
+# Content chunking & manifests
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class RDAChunkRef:
+    blob_id: str
+    idx: int
+    size: int
+    sha3: str
+
+
+@dataclass(frozen=True)
+class RDAManifest:
+    object_key: str
+    codec: str
+    original_size: int
+    chunk_size: int
+    chunks: tuple[RDAChunkRef, ...]
+    sealed: bool
+    seal_ad: str
+    seal_mac: str
+
+    def digest(self) -> str:
+        payload = json.dumps(
+            {
+                "object_key": self.object_key,
+                "codec": self.codec,
+                "original_size": self.original_size,
