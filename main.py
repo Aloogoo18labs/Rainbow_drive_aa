@@ -727,3 +727,84 @@ class RDACluster:
         ct, mac = rda_seal(payload, key=self._seal_key, ad=ad)
         return True, ct, "0x" + ad.hex(), "0x" + mac.hex()
 
+    def _open_if_needed(self, object_key: str, payload: bytes, sealed: bool, seal_ad: str, seal_mac: str) -> bytes:
+        if not sealed:
+            return payload
+        if not (seal_ad.startswith("0x") and seal_mac.startswith("0x")):
+            raise RDAIntegrityError("RDA: missing seal metadata")
+        ad = bytes.fromhex(seal_ad[2:])
+        mac = bytes.fromhex(seal_mac[2:])
+        return rda_open(payload, mac=mac, key=self._seal_key, ad=ad)
+
+    def put(self, object_key: str, data: bytes) -> RDAWriteReceipt:
+        if not object_key or len(object_key) > 256:
+            raise RDAInvalidArgument("object_key must be 1..256 chars")
+        codec, encoded, original_size = self._encode_object(data)
+        sealed, sealed_payload, seal_ad, seal_mac = self._seal_if_needed(object_key, encoded)
+
+        chunks = rda_split_bytes(sealed_payload, self.policy.chunk_size)
+        chunk_refs: list[RDAChunkRef] = []
+        stored: list[RDAReplica] = []
+
+        # Select nodes for each chunk independently to diversify placement.
+        for idx, chunk in enumerate(chunks):
+            blob_id = rda_id_hex("rdaBlob", 14) + f":{idx:04d}"
+            blob = RDABlob.from_payload(blob_id, chunk)
+            chunk_refs.append(RDAChunkRef(blob_id=blob_id, idx=idx, size=len(chunk), sha3=blob.sha3))
+
+            targets = self._place.select_targets(self.nodes(), object_key=f"{object_key}#{idx}")
+            acks = 0
+            for n in targets:
+                try:
+                    rep = n.put(blob)
+                except (RDAFault, RDAAdmissionDenied):
+                    continue
+                stored.append(rep)
+                self._register_replica(rep)
+                acks += 1
+                if acks >= self.policy.write_quorum:
+                    break
+
+            if acks < self.policy.write_quorum:
+                raise RDAQuorumError(
+                    f"RDA: write quorum not met for chunk {idx} (acks={acks}, need={self.policy.write_quorum})"
+                )
+
+            self._log.emit(
+                RDAEventKind.PUT_REPLICATED,
+                None,
+                {"object_key": object_key, "chunk": idx, "blob_id": blob_id, "acks": acks},
+            )
+
+        manifest = RDAManifest(
+            object_key=object_key,
+            codec=codec,
+            original_size=original_size,
+            chunk_size=self.policy.chunk_size,
+            chunks=tuple(chunk_refs),
+            sealed=sealed,
+            seal_ad=seal_ad,
+            seal_mac=seal_mac,
+        )
+        digest = manifest.digest()
+        self._manifests[object_key] = manifest
+        self._log.emit(
+            RDAEventKind.PUT_ACCEPTED,
+            None,
+            {"object_key": object_key, "manifest": digest, "chunks": len(chunk_refs), "codec": codec, "sealed": sealed},
+        )
+        return RDAWriteReceipt(
+            object_key=object_key,
+            manifest=manifest,
+            manifest_digest=digest,
+            stored_replicas=tuple(stored),
+            write_quorum=self.policy.write_quorum,
+        )
+
+    def _fetch_blob_quorum(self, blob_id: str, want_sha3: str) -> tuple[RDABlob, tuple[str, ...]]:
+        hosts = sorted(self._blob_index.get(blob_id, set()))
+        if not hosts:
+            raise RDANotFound("RDA: no replicas indexed for blob")
+
+        served: list[str] = []
+        hits: list[RDABlob] = []
