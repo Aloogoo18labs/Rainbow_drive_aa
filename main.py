@@ -808,3 +808,84 @@ class RDACluster:
 
         served: list[str] = []
         hits: list[RDABlob] = []
+        for node_id in hosts:
+            node = self._nodes.get(node_id)
+            if node is None:
+                continue
+            try:
+                blob = node.get(blob_id)
+            except (RDAFault, RDANotFound):
+                continue
+            if blob.sha3 != want_sha3:
+                continue
+            hits.append(blob)
+            served.append(node_id)
+            if len(hits) >= self.policy.read_quorum:
+                break
+        if len(hits) < self.policy.read_quorum:
+            raise RDAQuorumError(
+                f"RDA: read quorum not met for blob {blob_id} (hits={len(hits)}, need={self.policy.read_quorum})"
+            )
+        # Deterministic pick: earliest created blob among quorum.
+        hits.sort(key=lambda b: b.created_at)
+        return hits[0], tuple(served)
+
+    def get(self, object_key: str) -> tuple[bytes, RDAReadReceipt]:
+        m = self._manifests.get(object_key)
+        if m is None:
+            raise RDANotFound("RDA: object manifest not found")
+        got_chunks: list[bytes] = []
+        served_all: list[str] = []
+        repaired = False
+
+        for cref in m.chunks:
+            blob, served = self._fetch_blob_quorum(cref.blob_id, want_sha3=cref.sha3)
+            got_chunks.append(blob.payload)
+            served_all.extend(list(served))
+
+        sealed_payload = b"".join(got_chunks)
+        opened = self._open_if_needed(object_key, sealed_payload, sealed=m.sealed, seal_ad=m.seal_ad, seal_mac=m.seal_mac)
+        decoded = self._decode_object(m.codec, opened, m.original_size)
+
+        # Opportunistic repair: if any chunk has fewer replicas than desired, top it up.
+        for cref in m.chunks:
+            cur = self._blob_index.get(cref.blob_id, set())
+            if len(cur) >= self.policy.replicas:
+                continue
+            repaired = True
+            try:
+                self._repair_blob(object_key, cref)
+            except RDAFault:
+                pass
+
+        self._log.emit(
+            RDAEventKind.GET_SERVED,
+            None,
+            {"object_key": object_key, "bytes": len(decoded), "served_from": len(set(served_all)), "repaired": repaired},
+        )
+        if repaired:
+            self._log.emit(RDAEventKind.GET_REPAIRED, None, {"object_key": object_key})
+
+        receipt = RDAReadReceipt(
+            object_key=object_key,
+            size=len(decoded),
+            served_from=tuple(sorted(set(served_all))),
+            repaired=repaired,
+            manifest_digest=m.digest(),
+        )
+        return decoded, receipt
+
+    def _repair_blob(self, object_key: str, cref: RDAChunkRef) -> int:
+        blob, _served = self._fetch_blob_quorum(cref.blob_id, want_sha3=cref.sha3)
+        targets = self._place.select_targets(self.nodes(), object_key=f"{object_key}#repair:{cref.idx}")
+        placed = 0
+        for n in targets:
+            if n.node_id in self._blob_index.get(cref.blob_id, set()):
+                continue
+            try:
+                rep = n.put(blob)
+            except (RDAFault, RDAAdmissionDenied):
+                continue
+            self._register_replica(rep)
+            placed += 1
+            self._log.emit(
