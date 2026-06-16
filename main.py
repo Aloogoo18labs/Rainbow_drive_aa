@@ -565,3 +565,84 @@ def rda_default_policy() -> RDAPlacementPolicy:
         chunk_size=48_000,
         compress_level=6,
         seal=True,
+    )
+
+
+class RDAPlacementEngine:
+    def __init__(self, policy: RDAPlacementPolicy) -> None:
+        self.policy = policy
+        self._salt = _sha3((RDA_DOMAIN_SEED + ":" + hex(RDA_BUILD_NONCE)).encode())[:16]
+
+    def rank_nodes(self, candidates: list[RDANodeScore], object_key: str) -> list[RDANodeScore]:
+        """
+        Produce a stable ranking incorporating rendezvous randomness + node score.
+        """
+        key = _sha3(object_key.encode())
+        ranked: list[tuple[float, RDANodeScore]] = []
+        for s in candidates:
+            if s.trust < self.policy.min_trust:
+                continue
+            rv = _score_rendezvous(key, s.node_id, self._salt)
+            rvf = (rv % 10_000_000) / 10_000_000.0
+            region_bias = 0.0
+            if s.region in self.policy.prefer_regions:
+                idx = self.policy.prefer_regions.index(s.region)
+                region_bias = 0.04 * (1.0 - idx / max(1.0, float(len(self.policy.prefer_regions))))
+            score = s.composite() + 0.18 * rvf + region_bias
+            ranked.append((score, s))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return [s for _, s in ranked]
+
+    def select_targets(self, nodes: list[RDANode], object_key: str) -> list[RDANode]:
+        if not nodes:
+            raise RDARoutingError("no nodes available")
+        scores = [n.score() for n in nodes]
+        ranked = self.rank_nodes(scores, object_key)
+        if not ranked:
+            raise RDAAdmissionDenied("no nodes satisfy trust policy")
+        chosen: list[RDANode] = []
+        region_counts: dict[str, int] = {}
+        for s in ranked:
+            n = next((x for x in nodes if x.node_id == s.node_id), None)
+            if n is None:
+                continue
+            region_counts.setdefault(n.region, 0)
+            # Avoid heavy skew: keep at least 2 regions when possible.
+            if region_counts[n.region] >= self.policy.max_region_skew:
+                continue
+            if s.available_bytes() <= 0:
+                continue
+            chosen.append(n)
+            region_counts[n.region] += 1
+            if len(chosen) >= self.policy.replicas:
+                break
+        if len(chosen) < min(self.policy.replicas, len(nodes)):
+            # Fall back to best remaining nodes (still filtered by trust).
+            for s in ranked:
+                if len(chosen) >= min(self.policy.replicas, len(nodes)):
+                    break
+                if any(n.node_id == s.node_id for n in chosen):
+                    continue
+                n = next((x for x in nodes if x.node_id == s.node_id), None)
+                if n is None or s.available_bytes() <= 0:
+                    continue
+                chosen.append(n)
+        if not chosen:
+            raise RDAAdmissionDenied("no placement targets")
+        return chosen
+
+
+# ==============================================================================
+# Cluster: orchestrates routing, replication, audits, and repairs
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class RDAWriteReceipt:
+    object_key: str
+    manifest: RDAManifest
+    manifest_digest: str
+    stored_replicas: tuple[RDAReplica, ...]
+    write_quorum: int
+
+
