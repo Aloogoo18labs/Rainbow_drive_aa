@@ -1051,3 +1051,84 @@ class RDACluster:
 
 
 # ==============================================================================
+# Demo harness and CLI
+# ==============================================================================
+
+
+def _mk_demo_cluster(
+    *,
+    nodes: int = 11,
+    seed: int | None = None,
+    fault_rate: float = 0.02,
+) -> RDACluster:
+    if seed is not None:
+        random.seed(seed)
+    cl = RDACluster()
+    regions = ["na", "eu", "ap", "sa"]
+    for i in range(nodes):
+        region = random.choice(regions)
+        node_id = rda_id_hex("rdaNode", 10) + f":{i:02d}"
+        cap = random.randint(2_200_000, 6_800_000)
+        fr = max(0.0, float(fault_rate)) * (0.6 + random.random() * 0.9)
+        jitter = (random.randint(1, 7), random.randint(9, 39))
+        cl.add_node(RDANode(node_id=node_id, region=region, capacity_bytes=cap, fault_rate=fr, jitter_ms=jitter))
+    return cl
+
+
+def _rand_payload_bytes(n: int, flavor: str) -> bytes:
+    n = max(0, int(n))
+    if n == 0:
+        return b""
+    # Blend structured + random: compressible enough to see zlib effect.
+    header = json.dumps(
+        {
+            "schema": RDA_SCHEMA,
+            "flavor": flavor,
+            "nonce": secrets.token_hex(10),
+            "ts": time.time(),
+            "anchors": [RDA_ADDRESS_A, RDA_ADDRESS_B, RDA_ADDRESS_C],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    pad = b"|".join(
+        [
+            b"rda",
+            base64.b64encode(_sha3(header)),
+            base64.b64encode(_blake(header, out=32)),
+            b"block",
+        ]
+    )
+    out = bytearray()
+    while len(out) < n:
+        take = min(len(pad), n - len(out))
+        out.extend(pad[:take])
+        if len(out) >= n:
+            break
+        out.extend(secrets.token_bytes(min(192, n - len(out))))
+    return bytes(out)
+
+
+def rda_smoke_run(
+    *,
+    objects: int = 9,
+    object_bytes: int = 210_000,
+    chaos_intensity: float = 0.14,
+    audits: int = 2,
+    seed: int | None = None,
+) -> dict[str, t.Any]:
+    cl = _mk_demo_cluster(nodes=13, seed=seed, fault_rate=0.015)
+    keys = []
+    receipts = []
+    for i in range(max(1, int(objects))):
+        k = f"rainbow://drive-aa/{uuid.uuid4().hex}/{i:02d}"
+        data = _rand_payload_bytes(object_bytes + (i * 333), flavor="demo")
+        wr = cl.put(k, data)
+        keys.append(k)
+        receipts.append(wr.manifest_digest)
+
+    removed = cl.forget_some_replicas(intensity=chaos_intensity)
+
+    reads_ok = 0
+    repaired = 0
+    for k in keys:
