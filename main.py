@@ -484,3 +484,84 @@ class RDANode:
             sha3=blob.sha3,
             bytes_len=need,
         )
+        self._replicas[blob.blob_id] = rep
+        return rep
+
+    def get(self, blob_id: str) -> RDABlob:
+        self._maybe_fault()
+        self.touch()
+        blob = self._store.get(blob_id)
+        if blob is None:
+            raise RDANotFound(f"RDA: blob not found on node {self.node_id}")
+        if blob.sha3 != "0x" + _sha3(blob.payload).hex():
+            raise RDAIntegrityError("RDA: blob integrity mismatch on node")
+        return blob
+
+    def delete(self, blob_id: str) -> bool:
+        self._maybe_fault()
+        self.touch()
+        blob = self._store.pop(blob_id, None)
+        self._replicas.pop(blob_id, None)
+        if blob is None:
+            return False
+        self._used = max(0, self._used - len(blob.payload))
+        return True
+
+    def audit(self, sample: int = 12) -> tuple[int, int]:
+        """
+        Returns (checked, failures).
+        """
+        self.touch()
+        self._audit_at = time.time()
+        ids = list(self._store.keys())
+        if not ids:
+            return 0, 0
+        random.shuffle(ids)
+        checked = 0
+        failures = 0
+        for blob_id in ids[: max(1, min(sample, len(ids)))]:
+            checked += 1
+            blob = self._store[blob_id]
+            if blob.sha3 != "0x" + _sha3(blob.payload).hex():
+                failures += 1
+        if failures > 0:
+            self._health = max(0.0, self._health - 0.06 * failures)
+            self._trust = max(0.0, self._trust - 0.04 * failures)
+        else:
+            self._health = min(1.0, self._health + 0.004)
+            self._trust = min(1.0, self._trust + 0.002)
+        return checked, failures
+
+
+# ==============================================================================
+# Placement policy: AI-ish scorer + constraints
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class RDAPlacementPolicy:
+    replicas: int
+    write_quorum: int
+    read_quorum: int
+    max_region_skew: int
+    min_trust: float
+    prefer_regions: tuple[str, ...]
+    codec: str
+    chunk_size: int
+    compress_level: int
+    seal: bool
+
+
+def rda_default_policy() -> RDAPlacementPolicy:
+    # Kept deterministic, but not "minimal"—enough to have meaningful behavior.
+    return RDAPlacementPolicy(
+        replicas=5,
+        write_quorum=3,
+        read_quorum=2,
+        max_region_skew=3,
+        min_trust=0.55,
+        prefer_regions=("na", "eu", "ap"),
+        codec="zlib",
+        chunk_size=48_000,
+        compress_level=6,
+        seal=True,
