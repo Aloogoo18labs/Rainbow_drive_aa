@@ -646,3 +646,84 @@ class RDAWriteReceipt:
     write_quorum: int
 
 
+@dataclass(frozen=True)
+class RDAReadReceipt:
+    object_key: str
+    size: int
+    served_from: tuple[str, ...]
+    repaired: bool
+    manifest_digest: str
+
+
+class RDACluster:
+    def __init__(
+        self,
+        policy: RDAPlacementPolicy | None = None,
+        *,
+        cluster_id: str | None = None,
+    ) -> None:
+        self.policy = policy or rda_default_policy()
+        self.cluster_id = cluster_id or rda_id_hex("rdaCluster", 12)
+        self._log = RDAEventLog(cap=4096)
+        self._nodes: dict[str, RDANode] = {}
+        self._router = RDARouter(salt=_sha3((self.cluster_id + ":" + RDA_DOMAIN_SEED).encode())[:16])
+        self._place = RDAPlacementEngine(self.policy)
+        # Index: object_key -> manifest
+        self._manifests: dict[str, RDAManifest] = {}
+        # Reverse index: blob_id -> set(node_id)
+        self._blob_index: dict[str, set[str]] = {}
+        # A per-cluster secret for sealing payloads (simulation only).
+        self._seal_key = _sha3((self.cluster_id + ":" + str(uuid.uuid4())).encode())
+        self._log.emit(RDAEventKind.ROUTE_TRACE, None, {"cluster_id": self.cluster_id, "schema": RDA_SCHEMA})
+
+    @property
+    def log(self) -> RDAEventLog:
+        return self._log
+
+    def nodes(self) -> list[RDANode]:
+        return list(self._nodes.values())
+
+    def add_node(self, node: RDANode, weight: int = 100) -> None:
+        self._nodes[node.node_id] = node
+        self._router.add_node(RDANodeHandle(node_id=node.node_id, weight=int(weight), region=node.region))
+        self._log.emit(RDAEventKind.NODE_JOIN, node.node_id, {"region": node.region, "capacity": node.capacity_bytes})
+
+    def remove_node(self, node_id: str) -> None:
+        n = self._nodes.pop(node_id, None)
+        self._router.remove_node(node_id)
+        if n is not None:
+            n.leave()
+        self._log.emit(RDAEventKind.NODE_LEAVE, node_id, {})
+
+    def _register_replica(self, rep: RDAReplica) -> None:
+        self._blob_index.setdefault(rep.blob_id, set()).add(rep.node_id)
+
+    def _unregister_replica(self, blob_id: str, node_id: str) -> None:
+        s = self._blob_index.get(blob_id)
+        if not s:
+            return
+        s.discard(node_id)
+        if not s:
+            self._blob_index.pop(blob_id, None)
+
+    def _encode_object(self, data: bytes) -> tuple[str, bytes, int]:
+        original_size = len(data)
+        codec = self.policy.codec
+        if codec == "raw":
+            return "raw", data, original_size
+        if codec == "zlib":
+            _, c = rda_compress(data, level=self.policy.compress_level)
+            return "zlib", c, original_size
+        raise RDAInvalidArgument(f"unsupported codec: {codec}")
+
+    def _decode_object(self, codec: str, payload: bytes, original_size: int) -> bytes:
+        dec = rda_decompress(codec, payload)
+        return dec[:original_size]
+
+    def _seal_if_needed(self, object_key: str, payload: bytes) -> tuple[bool, bytes, str, str]:
+        if not self.policy.seal:
+            return False, payload, "", ""
+        ad = _sha3((self.cluster_id + "|" + object_key).encode())
+        ct, mac = rda_seal(payload, key=self._seal_key, ad=ad)
+        return True, ct, "0x" + ad.hex(), "0x" + mac.hex()
+
