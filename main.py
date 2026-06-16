@@ -79,3 +79,84 @@ class RDAQuorumError(RDAFault):
 
 class RDARoutingError(RDAFault):
     pass
+
+
+class RDALockError(RDAFault):
+    pass
+
+
+class RDAAdmissionDenied(RDAFault):
+    pass
+
+
+@dataclass(frozen=True)
+class RDAEvent:
+    kind: RDAEventKind
+    at: float
+    node_id: str | None
+    detail: dict[str, t.Any]
+
+
+class RDAEventLog:
+    def __init__(self, cap: int = 2_048) -> None:
+        self._cap = int(cap)
+        self._items: list[RDAEvent] = []
+
+    def emit(self, kind: RDAEventKind, node_id: str | None, detail: dict[str, t.Any]) -> None:
+        self._items.append(RDAEvent(kind=kind, at=time.time(), node_id=node_id, detail=detail))
+        if len(self._items) > self._cap:
+            del self._items[: len(self._items) - self._cap]
+
+    def tail(self, n: int = 64) -> list[RDAEvent]:
+        n = max(0, int(n))
+        return list(self._items[-n:])
+
+    def as_json(self, n: int = 64) -> str:
+        rows = []
+        for e in self.tail(n):
+            rows.append(
+                {
+                    "kind": e.kind.value,
+                    "at": e.at,
+                    "node_id": e.node_id,
+                    "detail": e.detail,
+                }
+            )
+        return json.dumps({"schema": RDA_SCHEMA, "events": rows}, indent=2, sort_keys=True)
+
+
+# ==============================================================================
+# Hashing, KDF, and lightweight "sealing"
+# ==============================================================================
+
+
+def _sha3(data: bytes) -> bytes:
+    return hashlib.sha3_256(data).digest()
+
+
+def _blake(data: bytes, out: int = 32, key: bytes | None = None) -> bytes:
+    if key is None:
+        return hashlib.blake2b(data, digest_size=out).digest()
+    return hashlib.blake2b(data, digest_size=out, key=key).digest()
+
+
+def _hkdf_sha3_256(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    if length <= 0:
+        raise RDAInvalidArgument("hkdf length must be > 0")
+    prk = hmac.new(salt, ikm, hashlib.sha3_256).digest()
+    out = b""
+    tval = b""
+    counter = 1
+    while len(out) < length:
+        tval = hmac.new(prk, tval + info + bytes([counter]), hashlib.sha3_256).digest()
+        out += tval
+        counter += 1
+        if counter > 255:
+            raise RDAInvalidArgument("hkdf length too large")
+    return out[:length]
+
+
+def _stream_xor(data: bytes, key_stream: bytes) -> bytes:
+    if not key_stream:
+        raise RDAInvalidArgument("empty keystream")
+    ks = key_stream
