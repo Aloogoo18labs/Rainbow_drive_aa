@@ -1213,3 +1213,72 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
+        prog="Rainbow_drive_aa",
+        description="AI-managed distributed storage simulation (local-only).",
+    )
+    p.add_argument("--version", action="store_true", help="print build info")
+    sub = p.add_subparsers(dest="cmd")
+
+    demo = sub.add_parser("demo", help="run a full simulation")
+    demo.add_argument("--objects", type=int, default=9)
+    demo.add_argument("--object-bytes", type=int, default=210_000)
+    demo.add_argument("--chaos", type=float, default=0.14)
+    demo.add_argument("--audits", type=int, default=2)
+    demo.add_argument("--seed", type=int, default=None)
+    demo.set_defaults(_fn=_cmd_demo)
+
+    pg = sub.add_parser("putget", help="store then retrieve a single object")
+    pg.add_argument("--nodes", type=int, default=11)
+    pg.add_argument("--seed", type=int, default=None)
+    pg.add_argument("--fault-rate", type=float, default=0.02)
+    pg.add_argument("--key", type=str, default=None)
+    pg.add_argument("--data", type=str, default=None, help="inline string payload; if omitted, random bytes are generated")
+    pg.add_argument("--bytes", type=int, default=90_000, help="random payload size when --data is omitted")
+    pg.add_argument("--chaos", type=float, default=0.12, help="replica deletion intensity before get")
+    pg.add_argument("--state", action="store_true", help="include exported state snapshot")
+    pg.add_argument("--events", action="store_true", help="include recent event tail")
+    pg.set_defaults(_fn=_cmd_put_get)
+
+    aud = sub.add_parser("audit", help="seed data then audit + repair")
+    aud.add_argument("--nodes", type=int, default=12)
+    aud.add_argument("--objects", type=int, default=8)
+    aud.add_argument("--object-bytes", type=int, default=120_000)
+    aud.add_argument("--sample-objects", type=int, default=6)
+    aud.add_argument("--per-node-sample", type=int, default=11)
+    aud.add_argument("--chaos", type=float, default=0.18)
+    aud.add_argument("--seed", type=int, default=None)
+    aud.add_argument("--fault-rate", type=float, default=0.02)
+    aud.set_defaults(_fn=_cmd_audit)
+
+    return p
+
+
+def _version_blob() -> dict[str, t.Any]:
+    return {
+        "schema": RDA_SCHEMA,
+        "name": "Rainbow_drive_aa",
+        "build": hex(RDA_BUILD_NONCE),
+        "anchors": {"ADDRESS_A": RDA_ADDRESS_A, "ADDRESS_B": RDA_ADDRESS_B, "ADDRESS_C": RDA_ADDRESS_C},
+        "domain_seed": RDA_DOMAIN_SEED,
+        "python": sys.version.split()[0],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = _build_parser()
+    args = p.parse_args(argv)
+
+    if args.version:
+        print(json.dumps(_version_blob(), indent=2, sort_keys=True))
+        return 0
+
+    fn = getattr(args, "_fn", None)
+    if fn is None:
+        p.print_help()
+        return 2
+    return int(fn(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
